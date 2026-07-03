@@ -75,3 +75,12 @@ Default input files are expected at:
 - `casestudy/6M0J.pdb` and `casestudy/DDG_6m0j.csv` for `rbd_ddg`.
 - `casestudy/7FAE_RBD_Fv.pdb` and `data/7FAE_RBD_Fv_mutation.yml` for
   `antibody_opt`.
+
+
+## best_model Checkpoint
+
+Model weights are not committed to this repository because checkpoint files are
+large. The pretrained checkpoint used in the case-study examples can be
+downloaded from Google Drive:
+
+[Download best_model checkpoint](https://drive.google.com/file/d/1Oee9DWvcLEsSFz6OTXs6yUYA6QGp0-WY/view?usp=drive_link)
