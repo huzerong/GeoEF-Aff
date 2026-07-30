@@ -110,6 +110,7 @@ class RelationMPNN(nn.Module):
     ) -> torch.Tensor:
         batch_size = coord.shape[0]
         agg = torch.zeros_like(coord)
+        edge_count = torch.zeros(batch_size, 1, dtype=coord.dtype, device=coord.device)
         
         for i, (edges, edge_feats, coord_diff) in enumerate(zip(edge_list, edge_feat_list, coord_diff_list)):
             if edges.shape[0] == 0:
@@ -136,10 +137,19 @@ class RelationMPNN(nn.Module):
                 
                 trans = trans * sampled_index.unsqueeze(-1).unsqueeze(-1)
             
+            trans = trans.squeeze(1)
             if self.coords_agg == 'mean':
-                agg.index_add_(0, edges[:, 1], trans.squeeze(1))
+                agg.index_add_(0, edges[:, 1], trans)
+                edge_count.index_add_(
+                    0,
+                    edges[:, 1],
+                    torch.ones(edges.shape[0], 1, dtype=coord.dtype, device=coord.device),
+                )
             else:
-                agg = scatter_add(trans.squeeze(1), edges[:, 1], dim=0, dim_size=batch_size)
+                agg = agg + scatter_add(trans, edges[:, 1], dim=0, dim_size=batch_size)
+        
+        if self.coords_agg == 'mean':
+            agg = agg / edge_count.clamp(min=1.0)
         
         agg = torch.clamp(agg, min=-10.0, max=10.0) # 限制幅度
         return coord + agg
@@ -276,16 +286,19 @@ class EdgeConstructor(nn.Module): # GNN KD tree
         coord: torch.Tensor,
         segment_ids: torch.Tensor,
         batch_id: torch.Tensor,
-        seq_idx: torch.Tensor
+        seq_idx: torch.Tensor,
+        chain_ids: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         from torch_cluster import radius_graph, knn_graph
 
         edge_list = []
         device = coord.device
+        if chain_ids is None:
+            chain_ids = segment_ids
 
         # --- 1. Intra-chain radius ball edges (same segment) ---
         ctx_edges_rball = self._build_rball_edges_cluster(
-            coord, segment_ids, batch_id, self.rball_radius, same_segment=True)
+            coord, chain_ids, batch_id, self.rball_radius, same_segment=True)
         edge_list.append(ctx_edges_rball)
 
         # --- 2,3. Global placeholder edges ---
@@ -294,20 +307,20 @@ class EdgeConstructor(nn.Module): # GNN KD tree
         edge_list.extend([global_normal, global_global])
 
         # --- 4,5. Sequential edges (d=1, d=2) ---
-        ctx_edges_seq_d1 = self._build_sequential_edges(seq_idx, segment_ids, batch_id, distance=1)
-        ctx_edges_seq_d2 = self._build_sequential_edges(seq_idx, segment_ids, batch_id, distance=2)
+        ctx_edges_seq_d1 = self._build_sequential_edges(seq_idx, chain_ids, batch_id, distance=1)
+        ctx_edges_seq_d2 = self._build_sequential_edges(seq_idx, chain_ids, batch_id, distance=2)
         edge_list.extend([ctx_edges_seq_d1, ctx_edges_seq_d2])
 
         # --- 6. Intra-chain KNN edges ---
         ctx_edges_knn = self._build_knn_edges_cluster(
-            coord, segment_ids, batch_id, self.knn_k, same_segment=True)
+            coord, chain_ids, batch_id, self.knn_k, same_segment=True)
         edge_list.append(ctx_edges_knn)
 
         # --- 7,8. Inter-chain radius ball + KNN edges ---
         inter_edges_rball = self._build_rball_edges_cluster(
-            coord, segment_ids, batch_id, self.rball_radius, same_segment=False)
+            coord, chain_ids, batch_id, self.rball_radius, same_segment=False)
         inter_edges_knn = self._build_knn_edges_cluster(
-            coord, segment_ids, batch_id, self.knn_k, same_segment=False)
+            coord, chain_ids, batch_id, self.knn_k, same_segment=False)
         edge_list.extend([inter_edges_rball, inter_edges_knn])
 
         return edge_list

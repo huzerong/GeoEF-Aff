@@ -6,6 +6,23 @@ from typing import Tuple, Dict, Optional
 from Bio.PDB import PDBParser
 
 
+AA3_TO_INDEX = {
+    'ALA': 0, 'CYS': 1, 'ASP': 2, 'GLU': 3, 'PHE': 4,
+    'GLY': 5, 'HIS': 6, 'ILE': 7, 'LYS': 8, 'LEU': 9,
+    'MET': 10, 'ASN': 11, 'PRO': 12, 'GLN': 13, 'ARG': 14,
+    'SER': 15, 'THR': 16, 'VAL': 17, 'TRP': 18, 'TYR': 19,
+    'UNK': 20,
+}
+
+AA1_TO_INDEX = {
+    'A': 0, 'C': 1, 'D': 2, 'E': 3, 'F': 4,
+    'G': 5, 'H': 6, 'I': 7, 'K': 8, 'L': 9,
+    'M': 10, 'N': 11, 'P': 12, 'Q': 13, 'R': 14,
+    'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
+    'X': 20,
+}
+
+
 class ProteinFeatureExtractor(nn.Module):
     
     def __init__(self, use_atom_features: bool = True):
@@ -17,13 +34,7 @@ class ProteinFeatureExtractor(nn.Module):
             'H': 6, 'CL': 7, 'BR': 8, 'I': 9, 'F': 10, 'UNK': 11
         }
         
-        self.aa_types = {
-            'ALA': 0, 'CYS': 1, 'ASP': 2, 'GLU': 3, 'PHE': 4,
-            'GLY': 5, 'HIS': 6, 'ILE': 7, 'LYS': 8, 'LEU': 9,
-            'MET': 10, 'ASN': 11, 'PRO': 12, 'GLN': 13, 'ARG': 14,
-            'SER': 15, 'THR': 16, 'VAL': 17, 'TRP': 18, 'TYR': 19,
-            'UNK': 20
-        }
+        self.aa_types = dict(AA3_TO_INDEX)
         
         self.rbf_layer = RBFLayer(num_rbf=16, max_distance=20.0)
         
@@ -45,6 +56,7 @@ class ProteinFeatureExtractor(nn.Module):
             'segment_ids': [],
             'seq_idx': [],
             'chain_ids': [],
+            'residue_ids': [],
             'residue_names': [],
             'atom_names': []
         }
@@ -56,7 +68,12 @@ class ProteinFeatureExtractor(nn.Module):
                 continue
                 
             chain = structure[0][chain_id]
-            segment_id = segment_mapping.get(chain_name, 0)
+            if chain_name.startswith("antigen"):
+                segment_id = segment_mapping["antigen"]
+            elif chain_name == "heavy":
+                segment_id = segment_mapping["heavy"]
+            else:
+                segment_id = segment_mapping["light"]
             
             for i, residue in enumerate(chain.get_residues()):
                 if not self._is_standard_residue(residue):
@@ -91,6 +108,8 @@ class ProteinFeatureExtractor(nn.Module):
                     features['segment_ids'].extend([segment_id] * len(residue_coords))
                     features['seq_idx'].extend([i] * len(residue_coords))
                     features['chain_ids'].extend([chain_id] * len(residue_coords))
+                    residue_id = str(residue.get_id()[1]) + residue.get_id()[2].strip()
+                    features['residue_ids'].extend([residue_id] * len(residue_coords))
                     features['residue_names'].extend([residue.resname] * len(residue_coords))
                     features['atom_names'].extend(residue_atom_names)
         

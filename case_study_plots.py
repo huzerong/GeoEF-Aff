@@ -11,6 +11,11 @@ def parse_args():
     parser.add_argument("--pred-csv", required=True)
     parser.add_argument("--task", choices=["regression", "ranking"], required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--score-col",
+        default="pred_ddg",
+        help="Prediction column used for ranking plots.",
+    )
     return parser.parse_args()
 
 
@@ -37,8 +42,8 @@ def plot_regression(rows, out_dir):
     plt.close()
 
 
-def plot_ranking(rows, out_dir):
-    ranked = sorted(rows, key=lambda x: float(x["pred_ddg"]))
+def plot_ranking(rows, out_dir, score_col="pred_ddg"):
+    ranked = sorted(rows, key=lambda x: float(x[score_col]))
     favorable = [r for r in ranked if int(r.get("is_favorable", "0")) == 1]
 
     muts = [r["mutation"] for r in favorable]
@@ -79,7 +84,7 @@ def main():
     if args.task == "regression":
         plot_regression(rows, args.out_dir)
     else:
-        plot_ranking(rows, args.out_dir)
+        plot_ranking(rows, args.out_dir, score_col=args.score_col)
 
 
 if __name__ == "__main__":

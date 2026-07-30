@@ -1,86 +1,141 @@
 # GeoEF-Aff
-<img width="1244" height="783" alt="3c82469a-bdfe-40dd-a03e-a8c755f4f116" src="https://github.com/user-attachments/assets/ab6923d3-d558-404c-a37d-368eb90a021a" />
 
+GeoEF-Aff is a mutation-aware multimodal framework for predicting
+mutation-induced changes in protein--protein binding affinity. It combines
+global and mutation-local ESM-2 representations, RAAD-based interface
+geometry, mutation-type features, and WT--Mut--Delta FoldX descriptors.
+
+This release is organized around one primary experiment:
+
+- complex-grouped train/validation/test split;
+- fixed ratio of 80:10:10;
+- random seed 42 by default;
+- frozen primary partition in `splits/fold_01/fold_01_split.json`;
+- validation data used for model selection and early stopping;
+- test data evaluated only after reloading `best_model.pth`.
+
+Three independently seeded 80:10:10 partition manifests are retained. The
+release distributes one final checkpoint, `models/best_model.pth`, rather than
+one checkpoint per fold. Details are provided in
+[`THREE_FOLD_EVALUATION.md`](THREE_FOLD_EVALUATION.md).
+
+## Repository layout
+
+```text
+GeoEF-Aff_Zenodo_8_1_1/
+  config.py                         central paths and hyperparameters
+  main.py                           primary 80:10:10 training entry point
+  model.py                          GeoEF-Aff model
+  dynamic_modules.py                RAAD/geometric modules
+  data_loader.py                    dataset and batching logic
+  protein_features.py               structure features
+  foldx_processor.py                FoldX interface
+  precompute_samples.py             structure/FoldX preprocessing
+  precompute_esm_embeddings.py      global and local ESM preprocessing
+  eval_kfold_cv_calibrated_3feature.py
+                                    optional three-fold evaluation
+  models/best_model.pth             released final checkpoint
+  splits/                            three frozen 80:10:10 partitions
+  checksums.sha256                   integrity checks for critical artifacts
+  uniair_external/                  HER2 and TCR--pMHC evaluation
+  data/README.md                    expected data layout
+  models/README.md                  checkpoint placement
+  tests/                             release-level static checks
+```
 
 ## Installation
 
-Using pip:
+Python 3.10 and a CUDA-capable Linux environment are recommended.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Or using the captured conda environment:
+`torch-scatter` and `torch-cluster` must match the installed PyTorch and CUDA
+versions. FoldX is separately licensed software and is not included.
+
+## Data layout
+
+Place the SKEMPI 2.0 table, structures, and precomputed features under `data/`
+as described in [`data/README.md`](data/README.md). All locations can also be
+overridden with environment variables:
 
 ```bash
-conda env create -f env.yaml
-conda activate affinity_py310
+export CSV_PATH=/path/to/skempi_v2.csv
+export PDB_DIR=/path/to/PDBs
+export PRECOMPUTED_DIR=/path/to/precomputed_samples
+export FOLDX_PATH=/path/to/foldx
 ```
 
-FoldX is not installed by these files. Place the FoldX executable at the path
-configured by `FOLDX_PATH` or `FOLDX5_PATH`.
-
-## Quick Start
-
-From the project root:
+## Preprocessing
 
 ```bash
-python train_3fold_cv.py --split-only
+python precompute_samples.py --workers 4
+python precompute_esm_embeddings.py
 ```
 
-Four-GPU sample-level 15-epoch training:
+To reuse compatible structure/FoldX samples before adding local ESM tokens:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nnodes=1 --nproc_per_node=4 \
-  foldx_3feature_retrain_3fold_cv_github/train_3fold_cv.py \
-  --split-mode sample \
-  --epochs 15 \
-  --save-all-epochs \
-  --batch-size-per-rank 2 \
-  --gradient-accumulation-steps 36 \
-  --num-workers-per-rank 6 \
-  --output-dir three_fold_results_sample_15epoch
+python prepare_localtoken_samples.py \
+  --source-dir /path/to/source_precomputed_samples \
+  --destination-dir /path/to/precomputed_samples
+python precompute_esm_embeddings.py
 ```
-## Case Study Testing
 
-`run_case_study.py` is a convenience wrapper for running a trained checkpoint on
-small case-study mutation tables. It currently supports two tasks:
+## Primary 80:10:10 experiment
 
-- `rbd_ddg`: 6M0J RBD mutation regression.
-- `antibody_opt`: 7FAE RBD-Fv antibody candidate ranking.
-
-From the project root, run one checkpoint on the bundled RBD case study:
+Single-process launch:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-python run_case_study.py rbd_ddg \
-  --ckpt /path/to/checkpoint.pth \
-  --out-dir casestudy/results/rbd_ddg_example \
-  --skip-plots
+python main.py
 ```
 
-Run the antibody optimization case study:
+Eight-GPU distributed launch:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-python run_case_study.py antibody_opt \
-  --ckpt /path/to/checkpoint.pth \
-  --out-dir casestudy/results/antibody_opt_example \
-  --skip-plots
+bash run_8gpu.sh
 ```
 
-Default input files are expected at:
+The default run uses the frozen seed-42 partition from
+`splits/fold_01/fold_01_split.json`. A newly trained model and runtime outputs
+are written to:
 
-- `casestudy/6M0J.pdb` and `casestudy/DDG_6m0j.csv` for `rbd_ddg`.
-- `casestudy/7FAE_RBD_Fv.pdb` and `data/7FAE_RBD_Fv_mutation.yml` for
-  `antibody_opt`.
+```text
+outputs/single_split_seed42/
+  best_model.pth
+  training.log
+  training_audit.json
+  validation_metrics.csv
+  prediction_scatterplot.png
+```
 
+To train with another retained partition without overwriting the primary run:
 
-## best_model Checkpoint
+```bash
+RANDOM_SEED=43 \
+SPLIT_JSON=splits/fold_02/fold_02_split.json \
+OUTPUT_DIR=outputs/single_split_seed43 \
+bash run_8gpu.sh
+```
 
-Model weights are not committed to this repository because checkpoint files are
-large. The pretrained checkpoint used in the case-study examples can be
-downloaded from Google Drive:
+Inference and case-study scripts use `models/best_model.pth` by default. The
+checkpoint file is not loaded or modified during split validation.
 
-[Download best_model checkpoint](https://drive.google.com/file/d/1Oee9DWvcLEsSFz6OTXs6yUYA6QGp0-WY/view?usp=drive_link)
+## Evaluation and case studies
+
+```bash
+python eval_pth_metrics.py --help
+python run_case_study.py --help
+python run_all_case_studies.py --help
+python m595_blind_prediction_3feature.py --help
+python uniair_external/run_pipeline.py --help
+```
+
+## Integrity verification
+
+Verify the released checkpoint and split files:
+
+```bash
+sha256sum -c checksums.sha256
+```

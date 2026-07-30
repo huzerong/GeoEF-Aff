@@ -10,7 +10,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+PROJECT_ROOT = SCRIPT_DIR
 for module_path in (PROJECT_ROOT, SCRIPT_DIR):
     if module_path in sys.path:
         sys.path.remove(module_path)
@@ -27,8 +27,15 @@ from sklearn.metrics import roc_auc_score
 from tqdm.auto import tqdm
 
 import config
-from case_study_infer import ESMEmbeddingHelper
-from data_loader import attach_mutation_masks, cached_structure_extraction
+from case_study_infer import ESMEmbeddingHelper, build_partner_mutation_positions
+from data_loader import (
+    attach_mutation_masks,
+    attach_structure_chain_indices,
+    build_all_chain_mapping,
+    build_structure_residue_indices,
+    cached_structure_extraction,
+    ensure_structure_residue_ids,
+)
 from foldx_processor import FoldXProcessor
 from model import ESM_FoldX_DDAffinity, ESM_RAAD_FoldX_DDAffinity
 
@@ -38,10 +45,20 @@ except ImportError:
     yaml = None
 
 
-BASE_DIR = PROJECT_ROOT
-ORIGINAL_DDAFFINITY_ROOT = os.path.join(BASE_DIR, "re", "DDAffinity-master")
-M595_DATA_ROOT = os.path.join(BASE_DIR, "m595", "M595_cache")
-DDAFFINITY_DATA_ROOT = os.path.join(BASE_DIR, "data", "M595_cache")
+BASE_DIR = config.BASE_DIR
+ORIGINAL_DDAFFINITY_ROOT = os.path.abspath(
+    os.environ.get(
+        "DDAFFINITY_ROOT",
+        os.path.join(BASE_DIR, "third_party", "DDAffinity"),
+    )
+)
+M595_DATA_ROOT = os.path.abspath(
+    os.environ.get(
+        "SM595_DATA_ROOT",
+        os.path.join(config.DATA_DIR, "SM595"),
+    )
+)
+DDAFFINITY_DATA_ROOT = M595_DATA_ROOT
 LEGACY_M595_DATA_ROOT = os.path.join(
     ORIGINAL_DDAFFINITY_ROOT, "data", "SKEMPI2", "M595_cache"
 )
@@ -49,9 +66,12 @@ DEFAULT_CASE_CONFIG = os.path.join(
     ORIGINAL_DDAFFINITY_ROOT, "configs", "inference", "blind_testing.yml"
 )
 DEFAULT_OUTPUT_DIR = os.path.join(
-    BASE_DIR, "casestudy", "results", "m595_3feature"
+    config.OUTPUT_DIR, "SM595"
 )
-DEFAULT_M595_FOLDX_CACHE_DIR = os.path.join(BASE_DIR, "m595", "M595_foldx_cache")
+DEFAULT_M595_FOLDX_CACHE_DIR = os.path.join(
+    config.DATA_DIR,
+    "SM595_foldx_cache",
+)
 M595_FOLDX_CACHE_VERSION = "m595_foldx_cache_v1"
 FOLDX_FEATURE_MODE = getattr(config, "FOLDX_FEATURE_MODE", "wt_mut_delta")
 _FOLDX_THREAD_LOCAL = threading.local()
@@ -60,14 +80,14 @@ _FOLDX_THREAD_LOCAL = threading.local()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run M595 multiple-mutation blind prediction with this folder's "
-            "3-feature FoldX checkpoint(s), using the original M595 cache entries."
+            "Evaluate the SKEMPI 2.0-derived SM595 multiple-mutation subset "
+            "with this package's 3-feature FoldX checkpoint(s)."
         )
     )
     parser.add_argument(
         "--case-config",
         default=None,
-        help="Original DDAffinity blind-testing YAML used for default M595 paths.",
+        help="Legacy DDAffinity YAML used only to resolve SM595 file paths.",
     )
     parser.add_argument(
         "--ckpt",
@@ -219,7 +239,7 @@ def validate_runtime_config() -> None:
     feature_dim = getattr(config, "FOLDX_FEATURE_DIM", None)
     if feature_dim != 3:
         raise RuntimeError(
-            "m595_blind_prediction_3feature.py must import foldx_3feature_retrain/config.py. "
+            "The SM595 evaluator must import this release package's config.py. "
             f"Expected FOLDX_FEATURE_DIM=3, got {feature_dim!r}. Imported config: {config.__file__}"
         )
     if FOLDX_FEATURE_MODE != "wt_mut_delta":
@@ -307,6 +327,9 @@ def build_model():
             use_precomputed_esm=use_precomputed_esm,
             local_radius=getattr(config, "MUTATION_LOCAL_RADIUS", 10.0),
             esm_mutation_window_radius=getattr(config, "ESM_MUTATION_WINDOW_RADIUS", 8),
+            esm_local_max_tokens=getattr(config, "ESM_LOCAL_MAX_TOKENS", 32),
+            struct_local_max_residues=getattr(config, "STRUCT_LOCAL_MAX_RESIDUES", 32),
+            coords_agg=getattr(config, "COORDS_AGG", "mean"),
         )
 
     return ESM_FoldX_DDAffinity(
@@ -347,7 +370,8 @@ def load_weights(model, ckpt_path: str, device: str):
                 load_errors.append("module-prefix added state_dict")
                 raise RuntimeError(
                     "Failed to strictly load checkpoint into the 3-feature M595 model. "
-                    "Use a checkpoint trained from foldx_3feature_retrain; old 4D checkpoints are incompatible. "
+                    "Use a checkpoint trained by this localtoken32 experiment; "
+                    "older compressed-token or 4D checkpoints are incompatible. "
                     f"Tried: {', '.join(load_errors)}. Checkpoint: {ckpt_path}"
                 ) from exc
 
@@ -357,17 +381,7 @@ def load_weights(model, ckpt_path: str, device: str):
 
 
 def build_chain_mapping(group1: List[str], group2: List[str]) -> Dict[str, str]:
-    chain_mapping: Dict[str, str] = {}
-    if len(group1) == 1:
-        chain_mapping["heavy"] = group1[0]
-    elif len(group1) >= 2:
-        chain_mapping["heavy"] = group1[0]
-        chain_mapping["light"] = group1[1]
-
-    if len(group2) >= 1:
-        chain_mapping["antigen"] = group2[0]
-
-    return chain_mapping
+    return build_all_chain_mapping(group1, group2)
 
 
 def extract_sequences_and_mapping(pdb_path: str) -> Tuple[Dict[str, str], Dict[Tuple[str, str], int]]:
@@ -479,7 +493,8 @@ def extract_structure_data(
     pdb_path: str,
     group1: List[str],
     group2: List[str],
-    mutation_sites: Optional[List[Tuple[str, int]]] = None,
+    mutation_sites: Optional[List[Tuple[str, str]]] = None,
+    mutation_types: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     chain_mapping = build_chain_mapping(group1, group2)
     if not chain_mapping:
@@ -490,11 +505,20 @@ def extract_structure_data(
         chain_mapping,
         getattr(config, "USE_ATOM_FEATURES", True),
     )
+    structure_data = ensure_structure_residue_ids(structure_data, pdb_path, chain_mapping)
     if len(structure_data["coords"]) == 0:
         return None
 
-    structure_data = attach_mutation_masks(structure_data, mutation_sites or [])
+    structure_data = attach_mutation_masks(
+        structure_data,
+        mutation_sites or [],
+        mutation_types=mutation_types,
+    )
+    structure_data, _ = attach_structure_chain_indices(structure_data)
     structure_data["batch_ids"] = torch.zeros_like(structure_data["segment_ids"])
+    ca_mask, residue_uid, _ = build_structure_residue_indices(structure_data)
+    structure_data["ca_mask"] = ca_mask
+    structure_data["residue_uid"] = residue_uid
     return structure_data
 
 
@@ -532,6 +556,10 @@ def infer_one(model, sample: Dict[str, object]) -> float:
             wt_esm_embedding=sample.get("wt_esm_embedding"),
             mut_esm_embedding=sample.get("mut_esm_embedding"),
             mutation_esm_embedding=sample.get("mutation_esm_embedding"),
+            wt_esm_window_tokens=sample.get("wt_esm_window_tokens"),
+            mut_esm_window_tokens=sample.get("mut_esm_window_tokens"),
+            esm_window_padding_mask=sample.get("esm_window_padding_mask"),
+            esm_window_mutation_mask=sample.get("esm_window_mutation_mask"),
             foldx_features=sample.get("foldx_features"),
         )
     return float(pred.squeeze().detach().cpu().item())
@@ -786,26 +814,45 @@ def prepare_cached_inputs(
             normalized_mutation,
         )
         mutation_sites = []
+        mutation_types = {}
         for token in normalized_mutation.split(","):
-            _, chain_id, res_num_str, _ = parse_mutation_token(token)
+            orig_aa, chain_id, res_num_str, new_aa = parse_mutation_token(token)
             res_key = (chain_id, res_num_str)
             if res_key in wt_res_id_to_idx:
-                mutation_sites.append((chain_id, wt_res_id_to_idx[res_key]))
+                mutation_sites.append((chain_id, res_num_str))
+                mutation_types[(chain_id, res_num_str)] = (orig_aa, new_aa)
 
         wt_partner1, wt_partner2 = build_partner_sequences(wt_seqs, group1, group2)
         mt_partner1, mt_partner2 = build_partner_sequences(mutant_seqs, group1, group2)
         wt_esm_embedding = None
         mut_esm_embedding = None
         mutation_esm_embedding = None
+        wt_esm_window_tokens = None
+        mut_esm_window_tokens = None
+        esm_window_padding_mask = None
+        esm_window_mutation_mask = None
         if esm_helper is not None:
-            wt_esm_embedding = esm_helper.encode_complex(wt_partner1, wt_partner2).unsqueeze(0).cpu()
-            mut_esm_embedding = esm_helper.encode_complex(mt_partner1, mt_partner2).unsqueeze(0).cpu()
-            mutation_esm_embedding = esm_helper.encode_mutation_context(
+            esm_mutation_positions = build_partner_mutation_positions(
+                wt_seqs,
+                wt_res_id_to_idx,
+                group1,
+                group2,
+                mutation_sites,
+            )
+            esm_features = esm_helper.encode_local_token_pair(
                 wt_partner1,
                 wt_partner2,
                 mt_partner1,
                 mt_partner2,
-            ).unsqueeze(0).cpu()
+                expected_mutation_count=len(mutation_sites),
+                mutation_positions=esm_mutation_positions,
+            )
+            wt_esm_embedding = esm_features["wt_esm_embedding"].unsqueeze(0).cpu()
+            mut_esm_embedding = esm_features["mut_esm_embedding"].unsqueeze(0).cpu()
+            wt_esm_window_tokens = esm_features["wt_esm_window_tokens"].unsqueeze(0).cpu()
+            mut_esm_window_tokens = esm_features["mut_esm_window_tokens"].unsqueeze(0).cpu()
+            esm_window_padding_mask = esm_features["esm_window_padding_mask"].unsqueeze(0).cpu()
+            esm_window_mutation_mask = esm_features["esm_window_mutation_mask"].unsqueeze(0).cpu()
 
         structure_pdb_path = paths["pdb_mt_path"] if structure_source == "mt" else paths["pdb_wt_path"]
         structure_data = extract_structure_data(
@@ -813,6 +860,7 @@ def prepare_cached_inputs(
             group1,
             group2,
             mutation_sites=mutation_sites,
+            mutation_types=mutation_types,
         )
 
         cached_foldx = foldx_cache.get(entry_index)
@@ -866,6 +914,10 @@ def prepare_cached_inputs(
             "wt_esm_embedding": wt_esm_embedding,
             "mut_esm_embedding": mut_esm_embedding,
             "mutation_esm_embedding": mutation_esm_embedding,
+            "wt_esm_window_tokens": wt_esm_window_tokens,
+            "mut_esm_window_tokens": mut_esm_window_tokens,
+            "esm_window_padding_mask": esm_window_padding_mask,
+            "esm_window_mutation_mask": esm_window_mutation_mask,
         }
         prepared.append(sample)
 
@@ -896,6 +948,14 @@ def move_sample_to_device(sample: Dict[str, object], device: str) -> Dict[str, o
         moved["mut_esm_embedding"] = sample["mut_esm_embedding"].to(device)  # type: ignore[index]
     if sample.get("mutation_esm_embedding") is not None:
         moved["mutation_esm_embedding"] = sample["mutation_esm_embedding"].to(device)  # type: ignore[index]
+    for key in (
+        "wt_esm_window_tokens",
+        "mut_esm_window_tokens",
+        "esm_window_padding_mask",
+        "esm_window_mutation_mask",
+    ):
+        if sample.get(key) is not None:
+            moved[key] = sample[key].to(device)  # type: ignore[index]
     return moved
 
 

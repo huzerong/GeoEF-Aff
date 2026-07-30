@@ -12,7 +12,19 @@ from Bio.SeqUtils import seq1
 
 import config
 from case_study_foldx import CaseStudyFoldXBuilder
-from data_loader import attach_mutation_masks, cached_structure_extraction
+from data_loader import (
+    attach_mutation_masks,
+    attach_structure_chain_indices,
+    build_all_chain_mapping,
+    build_structure_residue_indices,
+    cached_structure_extraction,
+    ensure_structure_residue_ids,
+)
+from esm_local_tokens import (
+    build_local_esm_context,
+    pack_preselected_esm_tokens,
+    pool_packed_mutation_esm_features,
+)
 from eval_pth_metrics import build_model, load_weights
 from foldx_processor import FoldXProcessor
 
@@ -24,6 +36,7 @@ except ImportError:
 
 
 CASE_FOLDX_FEATURE_CACHE_VERSION = 3
+MAX_ESM_RESIDUES = 1022
 
 
 class ESMEmbeddingHelper:
@@ -40,7 +53,8 @@ class ESMEmbeddingHelper:
 
     def encode_complex_tokens(self, partner1_seq: str, partner2_seq: str):
         batch_converter = self.alphabet.get_batch_converter()
-        data = [("complex", partner1_seq + partner2_seq)]
+        sequence = (partner1_seq + partner2_seq)[:MAX_ESM_RESIDUES]
+        data = [("complex", sequence)]
         _, _, batch_tokens = batch_converter(data)
         batch_tokens = batch_tokens.to(self.device)
 
@@ -59,38 +73,77 @@ class ESMEmbeddingHelper:
         return pooled.detach(), token_representations[0, :actual_len].detach(), actual_len
 
     def encode_mutation_context(self, wt_partner1: str, wt_partner2: str, mut_partner1: str, mut_partner2: str) -> torch.Tensor:
-        _, wt_tokens, wt_len = self.encode_complex_tokens(wt_partner1, wt_partner2)
-        _, mut_tokens, mut_len = self.encode_complex_tokens(mut_partner1, mut_partner2)
-        max_len = min(wt_len, mut_len, len(wt_partner1 + wt_partner2), len(mut_partner1 + mut_partner2))
-        mutation_positions = [
-            idx for idx in range(max_len)
-            if (wt_partner1 + wt_partner2)[idx] != (mut_partner1 + mut_partner2)[idx]
-        ]
-        if not mutation_positions:
-            return wt_tokens.new_zeros(wt_tokens.shape[-1] * 4)
+        features = self.encode_local_token_pair(
+            wt_partner1,
+            wt_partner2,
+            mut_partner1,
+            mut_partner2,
+        )
+        return pool_packed_mutation_esm_features(features).detach()
 
-        pos_tensor = torch.tensor(mutation_positions, dtype=torch.long, device=wt_tokens.device)
-        wt_site = wt_tokens[pos_tensor].mean(dim=0)
-        mut_site = mut_tokens[pos_tensor].mean(dim=0)
-
-        window_radius = getattr(config, "ESM_MUTATION_WINDOW_RADIUS", 8)
-        window_mask = torch.zeros(max_len, dtype=torch.bool, device=wt_tokens.device)
-        for pos in mutation_positions:
-            start = max(0, pos - window_radius)
-            end = min(max_len, pos + window_radius + 1)
-            window_mask[start:end] = True
-        window_idx = torch.nonzero(window_mask, as_tuple=True)[0]
-        wt_window = wt_tokens[window_idx].mean(dim=0)
-        mut_window = mut_tokens[window_idx].mean(dim=0)
-        return torch.cat([wt_site, mut_site, mut_site - wt_site, mut_window - wt_window], dim=0).detach()
+    def encode_local_token_pair(
+        self,
+        wt_partner1: str,
+        wt_partner2: str,
+        mut_partner1: str,
+        mut_partner2: str,
+        expected_mutation_count: Optional[int] = None,
+        mutation_positions: Optional[List[int]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        wt_sequence = wt_partner1 + wt_partner2
+        mutant_sequence = mut_partner1 + mut_partner2
+        wt_pooled, wt_tokens, _ = self.encode_complex_tokens(
+            wt_partner1,
+            wt_partner2,
+        )
+        mutant_pooled, mutant_tokens, _ = self.encode_complex_tokens(
+            mut_partner1,
+            mut_partner2,
+        )
+        context = build_local_esm_context(
+            wt_sequence=wt_sequence,
+            mutant_sequence=mutant_sequence,
+            radius=getattr(config, "ESM_MUTATION_WINDOW_RADIUS", 8),
+            max_tokens=getattr(config, "ESM_LOCAL_MAX_TOKENS", 32),
+            max_context_length=MAX_ESM_RESIDUES,
+            expected_mutation_count=expected_mutation_count,
+            mutation_positions=mutation_positions,
+        )
+        if context["context_start"] != 0:
+            _, wt_tokens, _ = self.encode_complex_tokens(
+                context["wt_context_sequence"],
+                "",
+            )
+            _, mutant_tokens, _ = self.encode_complex_tokens(
+                context["mutant_context_sequence"],
+                "",
+            )
+        packed = pack_preselected_esm_tokens(
+            wt_context_tokens=wt_tokens,
+            mutant_context_tokens=mutant_tokens,
+            context_token_indices=context["context_token_indices"],
+            selected_positions=context["selected_positions"],
+            mutation_positions=context["mutation_positions"],
+            max_tokens=getattr(config, "ESM_LOCAL_MAX_TOKENS", 32),
+        )
+        return {
+            "wt_esm_embedding": wt_pooled.detach(),
+            "mut_esm_embedding": mutant_pooled.detach(),
+            **{key: value.detach() for key, value in packed.items()},
+        }
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run case-study inference with best_model1.pth-compatible inputs.")
+    parser = argparse.ArgumentParser(description="Run case-study inference with best_model.pth-compatible inputs.")
     parser.add_argument("--case-csv", required=True, help="Path to metadata CSV.")
-    parser.add_argument("--ckpt", default="best_model1.pth", help="Checkpoint path.")
+    parser.add_argument("--ckpt", default=config.BEST_MODEL_PATH, help="Checkpoint path. Default: best_model.pth.")
     parser.add_argument("--out-csv", required=True, help="Output CSV path for predictions.")
     parser.add_argument("--task", choices=["rbd_ddg", "antibody_opt"], required=True)
+    parser.add_argument(
+        "--skip-wt-aa-check",
+        action="store_true",
+        help="Relax WT amino-acid checks when attaching mutation-aware structure features.",
+    )
     return parser.parse_args()
 
 
@@ -131,17 +184,7 @@ def parse_mutation_token(token: str, default_chain: Optional[str] = None) -> Tup
 
 
 def build_chain_mapping(group1: List[str], group2: List[str]) -> Dict[str, str]:
-    chain_mapping: Dict[str, str] = {}
-    if len(group1) == 1:
-        chain_mapping["heavy"] = group1[0]
-    elif len(group1) >= 2:
-        chain_mapping["heavy"] = group1[0]
-        chain_mapping["light"] = group1[1]
-
-    if len(group2) >= 1:
-        chain_mapping["antigen"] = group2[0]
-
-    return chain_mapping
+    return build_all_chain_mapping(group1, group2)
 
 
 def extract_sequences_and_mapping(pdb_path: str):
@@ -196,6 +239,34 @@ def build_partner_sequences(seqs: Dict[str, str], group1: List[str], group2: Lis
     return partner1, partner2
 
 
+def build_partner_mutation_positions(
+    seqs: Dict[str, str],
+    res_id_to_idx: Dict[Tuple[str, str], int],
+    group1: List[str],
+    group2: List[str],
+    mutation_sites: List[Tuple[str, str]],
+) -> List[int]:
+    """Map annotated PDB mutation sites onto the concatenated partner sequence."""
+    offsets: Dict[str, int] = {}
+    cursor = 0
+    for chain_id in group1:
+        offsets[chain_id] = cursor
+        cursor += len(seqs.get(chain_id, ""))
+    for chain_id in group2:
+        offsets[chain_id] = cursor
+        cursor += len(seqs.get(chain_id, ""))
+
+    positions: List[int] = []
+    for chain_id, residue_id in mutation_sites:
+        if chain_id not in offsets:
+            raise KeyError(f"Mutation chain {chain_id} is not in the partner groups.")
+        key = (chain_id, residue_id)
+        if key not in res_id_to_idx:
+            raise KeyError(f"Mutation residue {chain_id}{residue_id} was not indexed.")
+        positions.append(offsets[chain_id] + int(res_id_to_idx[key]))
+    return positions
+
+
 def canonicalize_mutation_string(
     mutation_str: str,
     default_chain: Optional[str] = None,
@@ -214,7 +285,9 @@ def extract_structure_data(
     pdb_path: str,
     group1: List[str],
     group2: List[str],
-    mutation_sites: Optional[List[Tuple[str, int]]] = None,
+    mutation_sites: Optional[List[Tuple[str, str]]] = None,
+    mutation_types: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
+    strict_wt_check: bool = True,
 ) -> Optional[Dict[str, torch.Tensor]]:
     chain_mapping = build_chain_mapping(group1, group2)
     if not chain_mapping:
@@ -225,11 +298,21 @@ def extract_structure_data(
         chain_mapping,
         getattr(config, "USE_ATOM_FEATURES", True),
     )
+    structure_data = ensure_structure_residue_ids(structure_data, pdb_path, chain_mapping)
     if len(structure_data["coords"]) == 0:
         return None
 
-    structure_data = attach_mutation_masks(structure_data, mutation_sites or [])
+    structure_data = attach_mutation_masks(
+        structure_data,
+        mutation_sites or [],
+        mutation_types=mutation_types,
+        strict_wt_check=strict_wt_check,
+    )
+    structure_data, _ = attach_structure_chain_indices(structure_data)
     structure_data["batch_ids"] = torch.zeros_like(structure_data["segment_ids"])
+    ca_mask, residue_uid, _ = build_structure_residue_indices(structure_data)
+    structure_data["ca_mask"] = ca_mask
+    structure_data["residue_uid"] = residue_uid
     return structure_data
 
 
@@ -329,6 +412,7 @@ def prepare_model_inputs(
     foldx_builder: CaseStudyFoldXBuilder,
     esm_helper: Optional[ESMEmbeddingHelper],
     device: torch.device,
+    strict_wt_check: bool = True,
 ) -> Dict[str, object]:
     pdb_path = os.path.abspath(row["pdb_path"])
     group1 = normalize_chain_group(row["chain_group_1"])
@@ -342,11 +426,20 @@ def prepare_model_inputs(
     seqs, res_id_to_idx = extract_sequences_and_mapping(pdb_path)
     wt_partner1, wt_partner2 = build_partner_sequences(seqs, group1, group2)
     mutation_sites = []
+    mutation_types = {}
     for token in normalized_mutation.split(","):
-        _, chain_id, res_num_str, _ = parse_mutation_token(token, default_chain=default_chain)
+        orig_aa, chain_id, res_num_str, new_aa = parse_mutation_token(
+            token,
+            default_chain=default_chain,
+        )
         res_key = (chain_id, res_num_str)
         if res_key in res_id_to_idx:
-            mutation_sites.append((chain_id, res_id_to_idx[res_key]))
+            mutation_sites.append((chain_id, res_num_str))
+            mutation_types[(chain_id, res_num_str)] = (orig_aa, new_aa)
+    is_noop_mutation = bool(mutation_types) and all(
+        orig_aa.upper() == new_aa.upper()
+        for orig_aa, new_aa in mutation_types.values()
+    )
 
     mutated_seqs = apply_mutations_to_sequences(
         seqs,
@@ -359,14 +452,17 @@ def prepare_model_inputs(
     structure_pdb_path = pdb_path
     mutant_pdb_path = ""
     foldx_buildmodel_ddg = 0.0
-    cached_foldx_features = load_case_foldx_feature_cache(
-        pdb_path=pdb_path,
-        chain_group_1=str(row["chain_group_1"]),
-        chain_group_2=str(row["chain_group_2"]),
-        normalized_mutation=normalized_mutation,
+    cached_foldx_features = None
+    if not is_noop_mutation:
+        cached_foldx_features = load_case_foldx_feature_cache(
+            pdb_path=pdb_path,
+            chain_group_1=str(row["chain_group_1"]),
+            chain_group_2=str(row["chain_group_2"]),
+            normalized_mutation=normalized_mutation,
     )
     should_build_mutant_pdb = (
-        getattr(config, "ENABLE_FOLDX", True)
+        not is_noop_mutation
+        and getattr(config, "ENABLE_FOLDX", True)
         and (
             getattr(config, "CASE_STUDY_BUILD_MUTANT_PDB", False)
             or getattr(config, "USE_MUTATION_FOLDX_FEATURES", False)
@@ -384,13 +480,30 @@ def prepare_model_inputs(
         )
         foldx_buildmodel_ddg = float(buildmodel_ddg or 0.0)
 
-    structure_data = extract_structure_data(structure_pdb_path, group1, group2, mutation_sites)
+    structure_data = extract_structure_data(
+        structure_pdb_path,
+        group1,
+        group2,
+        mutation_sites,
+        mutation_types,
+        strict_wt_check=strict_wt_check,
+    )
     if structure_data is not None:
         for key, value in structure_data.items():
             if isinstance(value, torch.Tensor):
                 structure_data[key] = value.to(device)
 
-    if cached_foldx_features is not None:
+    if is_noop_mutation:
+        foldx_energy = compute_foldx_energy(
+            foldx_processor,
+            structure_pdb_path,
+            group1,
+            group2,
+        )
+        mut_foldx_energy = foldx_energy
+        mutant_pdb_path = structure_pdb_path
+        foldx_buildmodel_ddg = 0.0
+    elif cached_foldx_features is not None:
         foldx_energy = float(cached_foldx_features.get("foldx_energy", 0.0))
         mut_foldx_energy = float(cached_foldx_features.get("foldx_mut_energy", foldx_energy))
     else:
@@ -409,7 +522,11 @@ def prepare_model_inputs(
         dtype=torch.float32,
         device=device,
     )
-    if cached_foldx_features is None and mutant_pdb_path:
+    if (
+        not is_noop_mutation
+        and cached_foldx_features is None
+        and mutant_pdb_path
+    ):
         save_case_foldx_feature_cache(
             {
                 "status": "ok",
@@ -432,15 +549,33 @@ def prepare_model_inputs(
 
     wt_esm_embedding = None
     mut_esm_embedding = None
+    wt_esm_window_tokens = None
+    mut_esm_window_tokens = None
+    esm_window_padding_mask = None
+    esm_window_mutation_mask = None
     if esm_helper is not None:
-        wt_esm_embedding = esm_helper.encode_complex(wt_partner1, wt_partner2).unsqueeze(0).to(device)
-        mut_esm_embedding = esm_helper.encode_complex(mut_partner1, mut_partner2).unsqueeze(0).to(device)
-        mutation_esm_embedding = esm_helper.encode_mutation_context(
+        esm_mutation_positions = build_partner_mutation_positions(
+            seqs,
+            res_id_to_idx,
+            group1,
+            group2,
+            mutation_sites,
+        )
+        esm_features = esm_helper.encode_local_token_pair(
             wt_partner1,
             wt_partner2,
             mut_partner1,
             mut_partner2,
-        ).unsqueeze(0).to(device)
+            expected_mutation_count=len(mutation_sites),
+            mutation_positions=esm_mutation_positions,
+        )
+        wt_esm_embedding = esm_features["wt_esm_embedding"].unsqueeze(0).to(device)
+        mut_esm_embedding = esm_features["mut_esm_embedding"].unsqueeze(0).to(device)
+        wt_esm_window_tokens = esm_features["wt_esm_window_tokens"].unsqueeze(0).to(device)
+        mut_esm_window_tokens = esm_features["mut_esm_window_tokens"].unsqueeze(0).to(device)
+        esm_window_padding_mask = esm_features["esm_window_padding_mask"].unsqueeze(0).to(device)
+        esm_window_mutation_mask = esm_features["esm_window_mutation_mask"].unsqueeze(0).to(device)
+        mutation_esm_embedding = None
     else:
         mutation_esm_embedding = None
 
@@ -455,6 +590,10 @@ def prepare_model_inputs(
         "wt_esm_embedding": wt_esm_embedding,
         "mut_esm_embedding": mut_esm_embedding,
         "mutation_esm_embedding": mutation_esm_embedding,
+        "wt_esm_window_tokens": wt_esm_window_tokens,
+        "mut_esm_window_tokens": mut_esm_window_tokens,
+        "esm_window_padding_mask": esm_window_padding_mask,
+        "esm_window_mutation_mask": esm_window_mutation_mask,
         "foldx_energy": foldx_energy,
         "foldx_mut_energy": mut_foldx_energy,
         "foldx_delta_interaction": mut_foldx_energy - foldx_energy,
@@ -480,6 +619,10 @@ def infer_one(model, sample: Dict[str, object]) -> float:
             wt_esm_embedding=sample["wt_esm_embedding"],
             mut_esm_embedding=sample["mut_esm_embedding"],
             mutation_esm_embedding=sample["mutation_esm_embedding"],
+            wt_esm_window_tokens=sample["wt_esm_window_tokens"],
+            mut_esm_window_tokens=sample["mut_esm_window_tokens"],
+            esm_window_padding_mask=sample["esm_window_padding_mask"],
+            esm_window_mutation_mask=sample["esm_window_mutation_mask"],
             foldx_features=sample.get("foldx_features"),
         )
     return float(pred.squeeze().detach().cpu().item())
@@ -516,7 +659,22 @@ def main():
 
     output_rows: List[Dict[str, object]] = []
     for row in tqdm(rows, desc="Running inference", unit="case"):
-        sample = prepare_model_inputs(row, foldx_processor, foldx_builder, esm_helper, device)
+        try:
+            sample = prepare_model_inputs(
+                row,
+                foldx_processor,
+                foldx_builder,
+                esm_helper,
+                device,
+                strict_wt_check=not args.skip_wt_aa_check,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to prepare case-study sample "
+                f"case_id={row.get('case_id', '')}, "
+                f"mutation={row.get('mutation', '')}, "
+                f"pdb_path={row.get('pdb_path', '')}"
+            ) from exc
         pred_ddg = infer_one(model, sample)
 
         out_row = dict(row)

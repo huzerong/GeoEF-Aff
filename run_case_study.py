@@ -7,7 +7,7 @@ from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Sequence
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+PROJECT_ROOT = SCRIPT_DIR
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 if PROJECT_ROOT not in sys.path:
@@ -18,10 +18,11 @@ try:
 except ImportError:
     yaml = None
 
+import config
 
-BASE_DIR = PROJECT_ROOT
-CASESTUDY_DIR = os.path.join(BASE_DIR, "casestudy")
-DDAFFINITY_DATA_DIR = os.path.join(BASE_DIR, "data")
+BASE_DIR = config.BASE_DIR
+CASESTUDY_DIR = config.CASE_STUDY_DIR
+DDAFFINITY_DATA_DIR = config.DATA_DIR
 CASE_STUDY_INFER = os.path.join(SCRIPT_DIR, "case_study_infer.py")
 CASE_STUDY_METRICS = os.path.join(SCRIPT_DIR, "case_study_metrics.py")
 CASE_STUDY_PLOTS = os.path.join(SCRIPT_DIR, "case_study_plots.py")
@@ -59,7 +60,7 @@ def parse_args() -> argparse.Namespace:
 
     add_common_args(subparsers.add_parser(
         "rbd_ddg",
-        help="Run the bundled 6M0J RBD mutation regression case study.",
+        help="Run the 6M0J RBD mutation regression case study.",
     ))
     add_common_args(subparsers.add_parser(
         "antibody_opt",
@@ -74,18 +75,18 @@ def parse_args() -> argparse.Namespace:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ckpt",
-        default="best_model1.pth",
-        help="Checkpoint path passed to case_study_infer.py.",
+        default=config.BEST_MODEL_PATH,
+        help="Checkpoint path passed to case_study_infer.py. Default filename: best_model.pth.",
     )
     parser.add_argument(
         "--out-dir",
         default=None,
-        help="Output directory. Defaults to casestudy/results/<task>.",
+        help="Output directory. Defaults to outputs/<seed>/case_studies/<task>.",
     )
     parser.add_argument(
         "--mutation-csv",
         default=None,
-        help="Mutation table in CSV/YAML format. For rbd_ddg it defaults to casestudy/DDG_6m0j.csv.",
+        help="Mutation table in CSV/YAML format. For rbd_ddg it defaults to CASE_STUDY_DIR/DDG_6m0j.csv.",
     )
     parser.add_argument(
         "--mutation-col",
@@ -106,6 +107,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--prepare-only",
         action="store_true",
         help="Only generate the metadata CSV, without running inference.",
+    )
+    parser.add_argument(
+        "--skip-wt-aa-check",
+        action="store_true",
+        help="Relax WT amino-acid checks when preparing mutation-aware structure features.",
     )
     parser.add_argument(
         "--skip-metrics",
@@ -406,7 +412,7 @@ def build_metadata_rows(
 
 def run_command(cmd: Sequence[str]) -> None:
     print("Running:", " ".join(cmd))
-    subprocess.run(cmd, cwd=BASE_DIR, check=True)
+    subprocess.run(cmd, cwd=SCRIPT_DIR, check=True)
 
 
 def main() -> None:
@@ -417,7 +423,8 @@ def main() -> None:
     chain_group_1 = args.chain_group_1 or defaults["chain_group_1"]
     chain_group_2 = args.chain_group_2 or defaults["chain_group_2"]
     out_dir = os.path.abspath(
-        args.out_dir or os.path.join(CASESTUDY_DIR, "results", args.task)
+        args.out_dir
+        or os.path.join(config.OUTPUT_DIR, "case_studies", args.task)
     )
     os.makedirs(out_dir, exist_ok=True)
 
@@ -471,6 +478,8 @@ def main() -> None:
         "--task",
         args.task,
     ]
+    if args.skip_wt_aa_check:
+        infer_cmd.append("--skip-wt-aa-check")
     run_command(infer_cmd)
 
     metrics_task = "regression" if args.task == "rbd_ddg" else "ranking"

@@ -13,10 +13,71 @@ import joblib
 import json
 
 from foldx_processor import FoldXProcessor
-from protein_features import ProteinFeatureExtractor
+from protein_features import AA1_TO_INDEX, ProteinFeatureExtractor
 
 
 import config
+from esm_local_tokens import (
+    LOCAL_ESM_KEYS,
+    LOCAL_TOKEN_VERSION_KEY,
+    MUTATION_MASK_KEY,
+    MUT_WINDOW_KEY,
+    PADDING_MASK_KEY,
+    POSITIONS_KEY,
+    WT_WINDOW_KEY,
+)
+
+
+def build_all_chain_mapping(
+    partner1_chains,
+    partner2_chains,
+) -> Dict[str, str]:
+    """Map every partner chain while preserving the three role segment types."""
+    mapping = {}
+    for index, chain_id in enumerate(partner1_chains):
+        if index == 0:
+            role = "heavy"
+        elif index == 1:
+            role = "light"
+        else:
+            role = f"antibody_{index}"
+        mapping[role] = str(chain_id)
+    for index, chain_id in enumerate(partner2_chains):
+        role = "antigen" if index == 0 else f"antigen_{index}"
+        mapping[role] = str(chain_id)
+    if not mapping:
+        raise ValueError("Cannot build an empty structure chain mapping.")
+    return mapping
+
+
+def attach_structure_chain_indices(
+    structure_data,
+    chain_offset=0,
+):
+    atom_count = int(structure_data["coords"].shape[0])
+    chain_ids = structure_data.get("chain_ids")
+    if not isinstance(chain_ids, (list, tuple)) or len(chain_ids) != atom_count:
+        raise ValueError(
+            "Structure chain_ids must align with coords to build chain indices."
+        )
+    mapping = {}
+    numeric_ids = []
+    for chain_id in chain_ids:
+        chain_key = str(chain_id)
+        if chain_key not in mapping:
+            mapping[chain_key] = int(chain_offset) + len(mapping)
+        numeric_ids.append(mapping[chain_key])
+    structure_data = dict(structure_data)
+    structure_data["chain_numeric_ids"] = torch.tensor(
+        numeric_ids,
+        dtype=torch.long,
+    )
+    structure_data["structure_chain_mapping_version"] = getattr(
+        config,
+        "STRUCTURE_CHAIN_MAPPING_VERSION",
+        2,
+    )
+    return structure_data, len(mapping)
 
 
 def load_mutation_foldx_features(row_idx: int) -> Dict[str, Any]:
@@ -76,11 +137,59 @@ def cached_structure_extraction(pdb_path: str, chain_mapping: Dict[str, str], us
     return extractor.extract_from_pdb(pdb_path, chain_mapping)
 
 
+def ensure_structure_residue_ids(
+    structure_features: Dict[str, Any],
+    pdb_path: str,
+    chain_mapping: Dict[str, str],
+) -> Dict[str, Any]:
+    """Add PDB residue ids to cached structure features that were produced by older code."""
+    structure_features = dict(structure_features)
+    coords = structure_features.get("coords")
+    if coords is None:
+        return structure_features
+
+    num_atoms = int(coords.shape[0])
+    residue_ids = structure_features.get("residue_ids")
+    if residue_ids is not None and len(residue_ids) == num_atoms:
+        return structure_features
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("protein", pdb_path)
+    extractor = ProteinFeatureExtractor()
+    rebuilt_residue_ids = []
+    atoms_to_extract = ["CA", "C", "N", "O"]
+
+    for chain_id in chain_mapping.values():
+        if chain_id not in [chain.id for chain in structure.get_chains()]:
+            continue
+        chain = structure[0][chain_id]
+        for residue in chain.get_residues():
+            if not extractor._is_standard_residue(residue):
+                continue
+            residue_atom_count = sum(1 for atom_name in atoms_to_extract if atom_name in residue)
+            if residue_atom_count < 3:
+                continue
+            emitted_atom_count = max(residue_atom_count, 4)
+            residue_id = str(residue.get_id()[1]) + residue.get_id()[2].strip()
+            rebuilt_residue_ids.extend([residue_id] * emitted_atom_count)
+
+    if len(rebuilt_residue_ids) != num_atoms:
+        raise RuntimeError(
+            f"Could not recover residue_ids for cached structure {pdb_path}: "
+            f"rebuilt={len(rebuilt_residue_ids)}, atoms={num_atoms}"
+        )
+
+    structure_features["residue_ids"] = rebuilt_residue_ids
+    return structure_features
+
+
 def attach_mutation_masks(
     structure_features: Dict[str, Any],
     mutation_sites: List[tuple],
+    mutation_types: Optional[Dict[tuple, tuple]] = None,
+    strict_wt_check: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Add atom-level masks for mutated residues to one extracted structure."""
+    """Add mutation masks and the mutant residue type aligned to every structure atom."""
     structure_features = dict(structure_features)
     coords = structure_features.get("coords")
     if coords is None:
@@ -89,37 +198,119 @@ def attach_mutation_masks(
     num_atoms = int(coords.shape[0])
     mutation_mask = torch.zeros(num_atoms, dtype=torch.bool)
     mutation_ca_mask = torch.zeros(num_atoms, dtype=torch.bool)
+    aa_types = structure_features.get("aa_types")
+    if not isinstance(aa_types, torch.Tensor) or int(aa_types.shape[0]) != num_atoms:
+        raise ValueError("Structure aa_types must align with coords before attaching mutation types.")
+    wt_aa_types = aa_types.clone().long()
+    mutant_aa_types = aa_types.clone().long()
+    mismatched_wt_sites = set()
+    matched_sites = set()
+
+    normalized_types = {}
+    for site, substitution in (mutation_types or {}).items():
+        chain_id, residue_id = site
+        wt_aa, mut_aa = substitution
+        wt_aa = str(wt_aa).upper()
+        mut_aa = str(mut_aa).upper()
+        if wt_aa not in AA1_TO_INDEX or wt_aa == "X":
+            raise ValueError(f"Unsupported WT amino-acid type {wt_aa!r} at {site}.")
+        if mut_aa not in AA1_TO_INDEX or mut_aa == "X":
+            raise ValueError(f"Unsupported mutant amino-acid type {mut_aa!r} at {site}.")
+        normalized_types[(str(chain_id), str(residue_id))] = (wt_aa, mut_aa)
+
+    if mutation_sites and not normalized_types and getattr(config, "REQUIRE_MUTATION_TYPE_FEATURES", True):
+        raise ValueError("Mutation sites were provided without WT/Mut amino-acid types.")
+
     if num_atoms == 0 or not mutation_sites:
         structure_features["mutation_mask"] = mutation_mask
         structure_features["mutation_ca_mask"] = mutation_ca_mask
+        structure_features["wt_aa_types"] = wt_aa_types
+        structure_features["mutant_aa_types"] = mutant_aa_types
+        structure_features["mutation_site_count"] = 0
+        structure_features["matched_mutation_site_count"] = 0
+        structure_features["mutation_wt_mismatch_count"] = 0
+        structure_features["mutation_type_feature_version"] = getattr(
+            config, "MUTATION_TYPE_FEATURE_VERSION", 2
+        )
         return structure_features
 
-    site_set = {(str(chain_id), int(seq_idx)) for chain_id, seq_idx in mutation_sites}
+    site_set = {(str(chain_id), str(residue_id)) for chain_id, residue_id in mutation_sites}
     chain_ids = structure_features.get("chain_ids", [])
+    residue_ids = structure_features.get("residue_ids", [])
     atom_names = structure_features.get("atom_names", [])
     seq_idx = structure_features.get("seq_idx")
 
-    if seq_idx is None or len(chain_ids) != num_atoms:
-        structure_features["mutation_mask"] = mutation_mask
-        structure_features["mutation_ca_mask"] = mutation_ca_mask
-        return structure_features
+    if len(chain_ids) != num_atoms:
+        raise ValueError("Structure chain_ids must align with coords.")
+    if len(residue_ids) != num_atoms and seq_idx is None:
+        raise ValueError(
+            "Structure needs aligned residue_ids or seq_idx for mutation matching."
+        )
 
     seq_idx_list = seq_idx.detach().cpu().tolist() if isinstance(seq_idx, torch.Tensor) else seq_idx
     for atom_idx in range(num_atoms):
-        site_key = (str(chain_ids[atom_idx]), int(seq_idx_list[atom_idx]))
+        if len(residue_ids) == num_atoms:
+            residue_key = str(residue_ids[atom_idx])
+        else:
+            residue_key = str(seq_idx_list[atom_idx])
+        site_key = (str(chain_ids[atom_idx]), residue_key)
         if site_key not in site_set:
             continue
+        if site_key not in normalized_types:
+            raise ValueError(f"Missing mutation type for structure site {site_key}.")
+        matched_sites.add(site_key)
         mutation_mask[atom_idx] = True
+        wt_aa, mut_aa = normalized_types[site_key]
+        wt_idx = AA1_TO_INDEX[wt_aa]
+        mut_idx = AA1_TO_INDEX[mut_aa]
+        observed_idx = int(aa_types[atom_idx].item())
+        if observed_idx != AA1_TO_INDEX["X"] and observed_idx != wt_idx:
+            mismatched_wt_sites.add(site_key)
+        wt_aa_types[atom_idx] = wt_idx
+        mutant_aa_types[atom_idx] = mut_idx
         atom_name = atom_names[atom_idx] if atom_idx < len(atom_names) else ""
         if str(atom_name).strip().upper() == "CA":
             mutation_ca_mask[atom_idx] = True
+
+    missing_sites = site_set.difference(matched_sites)
+    if missing_sites:
+        raise ValueError(
+            "Mutation sites did not match structure residues: "
+            f"{sorted(missing_sites)}"
+        )
 
     if mutation_mask.any() and not mutation_ca_mask.any():
         mutation_ca_mask = mutation_mask.clone()
 
     structure_features["mutation_mask"] = mutation_mask
     structure_features["mutation_ca_mask"] = mutation_ca_mask
+    structure_features["wt_aa_types"] = wt_aa_types
+    structure_features["mutant_aa_types"] = mutant_aa_types
+    structure_features["mutation_site_count"] = len(site_set)
+    structure_features["matched_mutation_site_count"] = len(matched_sites)
+    structure_features["mutation_wt_mismatch_count"] = len(mismatched_wt_sites)
+    structure_features["mutation_type_feature_version"] = getattr(
+        config, "MUTATION_TYPE_FEATURE_VERSION", 2
+    )
+    if strict_wt_check is None:
+        strict_wt_check = getattr(config, "STRICT_MUTATION_WT_CHECK", True)
+    if mismatched_wt_sites and strict_wt_check:
+        raise ValueError(
+            "WT amino-acid annotation disagrees with the structure at "
+            f"{len(mismatched_wt_sites)} site(s): {sorted(mismatched_wt_sites)}"
+        )
     return structure_features
+
+
+def build_mutation_site_id(complex_id: str, mutation_string: str) -> str:
+    sites = []
+    for raw_token in str(mutation_string).split(","):
+        token = raw_token.strip()
+        if len(token) < 4:
+            raise ValueError(f"Invalid mutation token for site grouping: {token!r}")
+        sites.append(token[1:-1])
+    return f"{str(complex_id).strip()}|{','.join(sorted(sites))}"
+
 
 class SKEMPI2Dataset(Dataset):
 
@@ -274,11 +465,12 @@ class SKEMPI2Dataset(Dataset):
             # Construct Mutant sequences
             mutant_seqs_dict = seqs.copy()
             mutation_sites = []
+            mutation_types = {}
             
             for mut in muts:
-                orig_aa = mut[0]
+                orig_aa = mut[0].upper()
                 chain_id = mut[1]
-                new_aa = mut[-1]
+                new_aa = mut[-1].upper()
                 res_num_str = mut[2:-1] # e.g. "38" or "38A"
                 
                 if chain_id in mutant_seqs_dict:
@@ -286,7 +478,8 @@ class SKEMPI2Dataset(Dataset):
                     res_key = (chain_id, res_num_str)
                     if res_key in res_id_to_idx:
                         idx_in_chain = res_id_to_idx[res_key]
-                        mutation_sites.append((chain_id, idx_in_chain))
+                        mutation_sites.append((chain_id, res_num_str))
+                        mutation_types[(chain_id, res_num_str)] = (orig_aa, new_aa)
                         chain_seq = list(mutant_seqs_dict[chain_id])
                         chain_seq[idx_in_chain] = new_aa
                         mutant_seqs_dict[chain_id] = "".join(chain_seq)
@@ -326,6 +519,7 @@ class SKEMPI2Dataset(Dataset):
                         ag_chains_ids,
                         pdb_id,
                         mutation_sites,
+                        mutation_types,
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -346,6 +540,11 @@ class SKEMPI2Dataset(Dataset):
                 "delta_g": delta_g,
                 "structure_data": structure_data,
                 "pdb_id": pdb_id,
+                "complex_id": str(row["#Pdb"]),
+                "mutation_site_id": build_mutation_site_id(
+                    str(row["#Pdb"]),
+                    str(row["Mutation(s)_cleaned"]),
+                ),
             }
             if foldx_features is None:
                 raise RuntimeError(f"foldx_features are required but missing for row {real_idx}")
@@ -364,19 +563,14 @@ class SKEMPI2Dataset(Dataset):
         ag_chains_ids: List[str],
         pdb_id: str,
         mutation_sites: Optional[List[tuple]] = None,
+        mutation_types: Optional[Dict[tuple, tuple]] = None,
     ) -> Optional[Dict[str, torch.Tensor]]:
         # 使用 joblib 缓存的函数
         # 构造 chain_mapping
-        chain_mapping = {}
-        
-        if len(ab_chains_ids) == 1:
-            chain_mapping['heavy'] = ab_chains_ids[0]
-        elif len(ab_chains_ids) >= 2:
-            chain_mapping['heavy'] = ab_chains_ids[0]
-            chain_mapping['light'] = ab_chains_ids[1]
-        
-        if len(ag_chains_ids) >= 1:
-            chain_mapping['antigen'] = ag_chains_ids[0]
+        chain_mapping = build_all_chain_mapping(
+            ab_chains_ids,
+            ag_chains_ids,
+        )
             
         try:
             # 调用缓存函数
@@ -384,6 +578,11 @@ class SKEMPI2Dataset(Dataset):
                 pdb_path, 
                 chain_mapping, 
                 self.structure_feature_extractor.use_atom_features
+            )
+            structure_features = ensure_structure_residue_ids(
+                structure_features,
+                pdb_path,
+                chain_mapping,
             )
             
             if len(structure_features['coords']) == 0:
@@ -393,6 +592,10 @@ class SKEMPI2Dataset(Dataset):
             structure_features = attach_mutation_masks(
                 structure_features,
                 mutation_sites or [],
+                mutation_types=mutation_types,
+            )
+            structure_features, _ = attach_structure_chain_indices(
+                structure_features
             )
             structure_features['batch_ids'] = torch.zeros_like(structure_features['segment_ids'])
             
@@ -400,6 +603,129 @@ class SKEMPI2Dataset(Dataset):
             
         except Exception as e:
             raise RuntimeError(f"Error extracting structure features from {pdb_path}") from e
+
+
+def _slice_atom_aligned_structure_data(structure_data, indices, atom_count):
+    sliced = {}
+    index_list = indices.detach().cpu().tolist()
+    for key, value in structure_data.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.dim() > 0
+            and value.shape[0] == atom_count
+        ):
+            sliced[key] = value[indices]
+        elif isinstance(value, list) and len(value) == atom_count:
+            sliced[key] = [value[index] for index in index_list]
+        elif isinstance(value, tuple) and len(value) == atom_count:
+            sliced[key] = tuple(value[index] for index in index_list)
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def build_structure_residue_indices(structure_data, residue_offset=0):
+    atom_count = int(structure_data["coords"].shape[0])
+    atom_names = structure_data.get("atom_names")
+    if not isinstance(atom_names, (list, tuple)) or len(atom_names) != atom_count:
+        raise ValueError(
+            "Structure atom_names must align with coords to build CA masks."
+        )
+    ca_mask = torch.tensor(
+        [
+            str(atom_name).strip().upper() == "CA"
+            for atom_name in atom_names
+        ],
+        dtype=torch.bool,
+    )
+
+    chain_ids = structure_data.get("chain_ids")
+    if not isinstance(chain_ids, (list, tuple)) or len(chain_ids) != atom_count:
+        raise ValueError(
+            "Structure chain_ids must align with coords to build residue IDs."
+        )
+
+    residue_mapping = {}
+    residue_uids = []
+    for chain_id, residue_seq_idx in zip(
+        chain_ids,
+        structure_data["seq_idx"].detach().cpu().tolist(),
+    ):
+        residue_key = (str(chain_id), int(residue_seq_idx))
+        if residue_key not in residue_mapping:
+            residue_mapping[residue_key] = (
+                int(residue_offset) + len(residue_mapping)
+            )
+        residue_uids.append(residue_mapping[residue_key])
+    return (
+        ca_mask,
+        torch.tensor(residue_uids, dtype=torch.long),
+        len(residue_mapping),
+    )
+
+
+def _select_complete_residue_atoms(
+    structure_data,
+    max_atoms,
+    deterministic=False,
+):
+    atom_count = int(structure_data["coords"].shape[0])
+    if atom_count <= max_atoms:
+        return torch.arange(atom_count, dtype=torch.long)
+
+    segment_ids = structure_data["segment_ids"].detach().cpu().long()
+    seq_idx = structure_data["seq_idx"].detach().cpu().long()
+    mutation_mask = structure_data.get("mutation_mask")
+    if not isinstance(mutation_mask, torch.Tensor):
+        mutation_mask = torch.zeros(atom_count, dtype=torch.bool)
+    else:
+        mutation_mask = mutation_mask.detach().cpu().bool()
+
+    residue_groups = {}
+    residue_order = []
+    for atom_index, key in enumerate(zip(segment_ids.tolist(), seq_idx.tolist())):
+        if key not in residue_groups:
+            residue_groups[key] = []
+            residue_order.append(key)
+        residue_groups[key].append(atom_index)
+
+    required_keys = [
+        key
+        for key in residue_order
+        if bool(mutation_mask[residue_groups[key]].any())
+    ]
+    required_atom_count = sum(len(residue_groups[key]) for key in required_keys)
+    if required_atom_count > max_atoms:
+        raise ValueError(
+            "Mutation residues alone exceed MAX_STRUCTURE_ATOMS: "
+            f"{required_atom_count} > {max_atoms}."
+        )
+
+    required_set = set(required_keys)
+    candidate_keys = [
+        key for key in residue_order if key not in required_set
+    ]
+    if not deterministic and candidate_keys:
+        order = torch.randperm(len(candidate_keys)).tolist()
+        candidate_keys = [candidate_keys[index] for index in order]
+
+    selected_keys = list(required_keys)
+    selected_atom_count = required_atom_count
+    for key in candidate_keys:
+        group_size = len(residue_groups[key])
+        if selected_atom_count + group_size > max_atoms:
+            continue
+        selected_keys.append(key)
+        selected_atom_count += group_size
+
+    selected_indices = sorted(
+        atom_index
+        for key in selected_keys
+        for atom_index in residue_groups[key]
+    )
+    if not selected_indices:
+        raise ValueError("Residue-aware structure sampling selected no atoms.")
+    return torch.tensor(selected_indices, dtype=torch.long)
 
 
 def filter_none_collate(batch):
@@ -425,33 +751,12 @@ def filter_none_collate(batch):
         # 原子数超限时随机采样
         if sd is not None and max_atoms is not None and sd['coords'].shape[0] > max_atoms:
             n = sd['coords'].shape[0]
-            mutation_mask = sd.get('mutation_mask')
-            mutation_ca_mask = sd.get('mutation_ca_mask')
-            keep_mask = torch.zeros(n, dtype=torch.bool)
-            if isinstance(mutation_mask, torch.Tensor) and mutation_mask.shape[0] == n:
-                keep_mask |= mutation_mask.cpu().bool()
-            if isinstance(mutation_ca_mask, torch.Tensor) and mutation_ca_mask.shape[0] == n:
-                keep_mask |= mutation_ca_mask.cpu().bool()
-            keep_idx = torch.nonzero(keep_mask, as_tuple=True)[0]
-            if keep_idx.numel() == 0:
-                if deterministic_structure_sampling:
-                    idx = torch.arange(n)[:max_atoms]
-                else:
-                    idx = torch.randperm(n)[:max_atoms].sort().values
-            elif keep_idx.numel() >= max_atoms:
-                if deterministic_structure_sampling:
-                    idx = keep_idx[:max_atoms].sort().values
-                else:
-                    idx = keep_idx[torch.randperm(keep_idx.numel())[:max_atoms]].sort().values
-            else:
-                rest_idx = torch.nonzero(~keep_mask, as_tuple=True)[0]
-                if deterministic_structure_sampling:
-                    extra_idx = rest_idx[:max_atoms - keep_idx.numel()]
-                else:
-                    extra_idx = rest_idx[torch.randperm(rest_idx.numel())[:max_atoms - keep_idx.numel()]]
-                idx = torch.cat([keep_idx, extra_idx]).sort().values
-            sd = {k: v[idx] if isinstance(v, torch.Tensor) and v.shape[0] == n else v
-                  for k, v in sd.items()}
+            idx = _select_complete_residue_atoms(
+                sd,
+                max_atoms=max_atoms,
+                deterministic=deterministic_structure_sampling,
+            )
+            sd = _slice_atom_aligned_structure_data(sd, idx, n)
         structure_data_list.append(sd)
         
         # 编码序列为tensor
@@ -509,27 +814,83 @@ def collate_structure_data(structure_data_list: List[Optional[Dict[str, torch.Te
     
     all_coords = []
     all_aa_types = []
+    all_wt_aa_types = []
+    all_mutant_aa_types = []
     all_atom_types = []
     all_segment_ids = []
     all_seq_idx = []
     all_batch_ids = []
+    all_chain_numeric_ids = []
+    all_ca_masks = []
+    all_residue_uids = []
     all_mutation_masks = []
     all_mutation_ca_masks = []
+    all_mutation_site_counts = []
+    all_matched_mutation_site_counts = []
+    all_mutation_wt_mismatch_counts = []
     
     atom_offset = 0
+    residue_offset = 0
+    chain_offset = 0
     
     for batch_id, struct_data in enumerate(valid_structures):
         all_coords.append(struct_data['coords'])
         all_aa_types.append(struct_data['aa_types'])
+        wt_aa_types = struct_data.get('wt_aa_types')
+        mutant_aa_types = struct_data.get('mutant_aa_types')
+        if not isinstance(wt_aa_types, torch.Tensor):
+            raise ValueError("Structure data is missing wt_aa_types.")
+        if not isinstance(mutant_aa_types, torch.Tensor):
+            raise ValueError("Structure data is missing mutant_aa_types.")
+        if wt_aa_types.shape != struct_data['aa_types'].shape:
+            raise ValueError("wt_aa_types must have the same shape as aa_types.")
+        if mutant_aa_types.shape != struct_data['aa_types'].shape:
+            raise ValueError("mutant_aa_types must have the same shape as aa_types.")
+        all_wt_aa_types.append(wt_aa_types)
+        all_mutant_aa_types.append(mutant_aa_types)
         all_atom_types.append(struct_data['atom_types'])
         all_segment_ids.append(struct_data['segment_ids'])
+        chain_numeric_ids = struct_data.get("chain_numeric_ids")
+        if not isinstance(chain_numeric_ids, torch.Tensor):
+            raise ValueError("Structure data is missing chain_numeric_ids.")
+        if chain_numeric_ids.shape != struct_data["segment_ids"].shape:
+            raise ValueError(
+                "chain_numeric_ids must have the same shape as segment_ids."
+            )
+        local_chain_ids = torch.unique(chain_numeric_ids, sorted=True)
+        remapped_chain_ids = torch.empty_like(chain_numeric_ids)
+        for local_index, chain_id in enumerate(local_chain_ids.tolist()):
+            remapped_chain_ids[chain_numeric_ids == chain_id] = (
+                chain_offset + local_index
+            )
+        all_chain_numeric_ids.append(remapped_chain_ids)
+        chain_offset += int(local_chain_ids.numel())
         num_atoms = struct_data['coords'].shape[0]
+        ca_mask, residue_uids, local_residue_count = (
+            build_structure_residue_indices(
+                struct_data,
+                residue_offset=residue_offset,
+            )
+        )
+        all_ca_masks.append(ca_mask)
+        all_residue_uids.append(residue_uids)
+        residue_offset += local_residue_count
         all_mutation_masks.append(
             struct_data.get('mutation_mask', torch.zeros(num_atoms, dtype=torch.bool))
         )
         all_mutation_ca_masks.append(
             struct_data.get('mutation_ca_mask', torch.zeros(num_atoms, dtype=torch.bool))
         )
+        mutation_site_count = struct_data.get('mutation_site_count')
+        matched_mutation_site_count = struct_data.get('matched_mutation_site_count')
+        if mutation_site_count is None or matched_mutation_site_count is None:
+            raise ValueError("Structure data is missing mutation site audit counts.")
+        all_mutation_site_counts.append(int(mutation_site_count))
+        all_matched_mutation_site_counts.append(int(matched_mutation_site_count))
+        mismatch_count = struct_data.get('mutation_wt_mismatch_count')
+        if mismatch_count is None:
+            raise ValueError("Structure data is missing mutation_wt_mismatch_count.")
+        all_mutation_wt_mismatch_counts.append(int(mismatch_count))
         
         seq_idx_adjusted = struct_data['seq_idx'] + atom_offset
         all_seq_idx.append(seq_idx_adjusted)
@@ -541,12 +902,32 @@ def collate_structure_data(structure_data_list: List[Optional[Dict[str, torch.Te
     
     collated['coords'] = torch.cat(all_coords, dim=0)
     collated['aa_types'] = torch.cat(all_aa_types, dim=0)
+    collated['wt_aa_types'] = torch.cat(all_wt_aa_types, dim=0)
+    collated['mutant_aa_types'] = torch.cat(all_mutant_aa_types, dim=0)
     collated['atom_types'] = torch.cat(all_atom_types, dim=0)
     collated['segment_ids'] = torch.cat(all_segment_ids, dim=0)
+    collated['chain_numeric_ids'] = torch.cat(
+        all_chain_numeric_ids,
+        dim=0,
+    )
     collated['seq_idx'] = torch.cat(all_seq_idx, dim=0)
     collated['batch_ids'] = torch.cat(all_batch_ids, dim=0)
+    collated['ca_mask'] = torch.cat(all_ca_masks, dim=0)
+    collated['residue_uid'] = torch.cat(all_residue_uids, dim=0)
     collated['mutation_mask'] = torch.cat(all_mutation_masks, dim=0)
     collated['mutation_ca_mask'] = torch.cat(all_mutation_ca_masks, dim=0)
+    collated['mutation_site_count'] = torch.tensor(
+        all_mutation_site_counts,
+        dtype=torch.long,
+    )
+    collated['matched_mutation_site_count'] = torch.tensor(
+        all_matched_mutation_site_counts,
+        dtype=torch.long,
+    )
+    collated['mutation_wt_mismatch_count'] = torch.tensor(
+        all_mutation_wt_mismatch_counts,
+        dtype=torch.long,
+    )
 
     return collated
 
@@ -597,14 +978,89 @@ class PrecomputedDataset(Dataset):
                 return "missing_structure"
             if "mutation_mask" not in structure_data or "mutation_ca_mask" not in structure_data:
                 return "missing_mutation_mask"
+            if "residue_ids" not in structure_data:
+                return "missing_residue_ids"
+            if "wt_aa_types" not in structure_data or "mutant_aa_types" not in structure_data:
+                return "missing_mutation_aa_types"
+            if (
+                "mutation_site_count" not in structure_data
+                or "matched_mutation_site_count" not in structure_data
+            ):
+                return "missing_mutation_site_audit_counts"
+            if "mutation_wt_mismatch_count" not in structure_data:
+                return "missing_mutation_wt_mismatch_count"
+            if structure_data.get("mutation_type_feature_version") != getattr(
+                config, "MUTATION_TYPE_FEATURE_VERSION", 2
+            ):
+                return "mutation_type_feature_version"
+            chain_numeric_ids = structure_data.get("chain_numeric_ids")
+            if not isinstance(chain_numeric_ids, torch.Tensor):
+                return "missing_chain_numeric_ids"
+            if chain_numeric_ids.shape != structure_data["segment_ids"].shape:
+                return "bad_chain_numeric_ids_shape"
+            if structure_data.get(
+                "structure_chain_mapping_version"
+            ) != getattr(config, "STRUCTURE_CHAIN_MAPPING_VERSION", 2):
+                return "structure_chain_mapping_version"
+
+        if not sample.get("complex_id"):
+            return "missing_complex_id"
+        if not sample.get("mutation_site_id"):
+            return "missing_mutation_site_id"
 
         if getattr(config, "USE_PRECOMPUTED_ESM", False):
-            required = {"wt_esm_embedding", "mut_esm_embedding", "mutation_esm_embedding"}
+            required = {
+                "wt_esm_embedding",
+                "mut_esm_embedding",
+                "mutation_esm_embedding",
+            } | LOCAL_ESM_KEYS
             missing = required.difference(sample.keys())
             if missing:
                 return "missing_" + "_".join(sorted(missing))
             if sample.get("esm_mutation_window_radius") != getattr(config, "ESM_MUTATION_WINDOW_RADIUS", 8):
                 return "esm_window_radius"
+            if sample.get(LOCAL_TOKEN_VERSION_KEY) != getattr(
+                config,
+                "ESM_LOCAL_TOKEN_VERSION",
+                1,
+            ):
+                return "esm_local_token_version"
+            max_tokens = getattr(config, "ESM_LOCAL_MAX_TOKENS", 32)
+            expected_shapes = {
+                "wt_esm_embedding": (1280,),
+                "mut_esm_embedding": (1280,),
+                "mutation_esm_embedding": (1280 * 4,),
+                WT_WINDOW_KEY: (max_tokens, 1280),
+                MUT_WINDOW_KEY: (max_tokens, 1280),
+                PADDING_MASK_KEY: (max_tokens,),
+                MUTATION_MASK_KEY: (max_tokens,),
+                POSITIONS_KEY: (max_tokens,),
+            }
+            for key, expected_shape in expected_shapes.items():
+                value = sample.get(key)
+                if not isinstance(value, torch.Tensor):
+                    return f"bad_{key}_type"
+                if tuple(value.shape) != expected_shape:
+                    return f"bad_{key}_shape"
+                if value.is_floating_point() and not bool(
+                    torch.isfinite(value).all()
+                ):
+                    return f"nonfinite_{key}"
+            padding_mask = sample[PADDING_MASK_KEY]
+            mutation_mask = sample[MUTATION_MASK_KEY]
+            positions = sample[POSITIONS_KEY]
+            if padding_mask.dtype != torch.bool:
+                return "bad_esm_padding_mask_dtype"
+            if mutation_mask.dtype != torch.bool:
+                return "bad_esm_mutation_mask_dtype"
+            if positions.dtype != torch.long:
+                return "bad_esm_window_positions_dtype"
+            if int((~padding_mask).sum().item()) < 1:
+                return "empty_esm_local_window"
+            if bool(mutation_mask[padding_mask].any()):
+                return "mutation_on_padded_esm_token"
+            if bool((positions[padding_mask] != -1).any()):
+                return "position_on_padded_esm_token"
 
         foldx_features = sample.get("foldx_features")
         if foldx_features is None:

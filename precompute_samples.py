@@ -16,10 +16,35 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import config
-from data_loader import attach_mutation_masks
-from protein_features import ProteinFeatureExtractor
+from data_loader import (
+    attach_mutation_masks,
+    attach_structure_chain_indices,
+    build_all_chain_mapping,
+    build_mutation_site_id,
+    cached_structure_extraction,
+    ensure_structure_residue_ids,
+)
 
 PRECOMPUTED_DIR = config.PRECOMPUTED_DIR
+FILTERABLE_STRUCTURE_ERROR_MARKERS = (
+    "Mutation sites did not match structure residues",
+    "Mutation residue ",
+    "Mutation chain ",
+)
+
+
+def read_mutation_foldx_cache(row_idx):
+    cache_dir = getattr(
+        config,
+        "MUTATION_FOLDX_CACHE_DIR",
+        os.path.join(config.BASE_DIR, "foldx_mutation_cache"),
+    )
+    cache_path = os.path.join(cache_dir, "sample_json", f"{row_idx}.json")
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(f"Missing mutation FoldX cache for row {row_idx}: {cache_path}")
+
+    with open(cache_path, "r", encoding="utf-8") as f:
+        return json.load(f), cache_path
 
 
 def parse_args():
@@ -36,17 +61,7 @@ def parse_args():
 
 
 def load_mutation_foldx_features(row_idx):
-    cache_dir = getattr(
-        config,
-        "MUTATION_FOLDX_CACHE_DIR",
-        os.path.join(config.BASE_DIR, "foldx_mutation_cache"),
-    )
-    cache_path = os.path.join(cache_dir, "sample_json", f"{row_idx}.json")
-    if not os.path.exists(cache_path):
-        raise FileNotFoundError(f"Missing mutation FoldX cache for row {row_idx}: {cache_path}")
-
-    with open(cache_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data, cache_path = read_mutation_foldx_cache(row_idx)
 
     if data.get("status") != "ok":
         raise ValueError(
@@ -152,15 +167,18 @@ def process_one_sample(args):
         # Mutant sequences
         mutant_seqs_dict = seqs.copy()
         mutation_sites = []
+        mutation_types = {}
         for mut in muts:
+            orig_aa = mut[0].upper()
             chain_id = mut[1]
-            new_aa = mut[-1]
+            new_aa = mut[-1].upper()
             res_num_str = mut[2:-1]
             if chain_id in mutant_seqs_dict:
                 res_key = (chain_id, res_num_str)
                 if res_key in res_id_to_idx:
                     idx_in_chain = res_id_to_idx[res_key]
-                    mutation_sites.append((chain_id, idx_in_chain))
+                    mutation_sites.append((chain_id, res_num_str))
+                    mutation_types[(chain_id, res_num_str)] = (orig_aa, new_aa)
                     chain_seq = list(mutant_seqs_dict[chain_id])
                     chain_seq[idx_in_chain] = new_aa
                     mutant_seqs_dict[chain_id] = "".join(chain_seq)
@@ -176,18 +194,23 @@ def process_one_sample(args):
         structure_data = None
         if use_structure:
             try:
-                extractor = ProteinFeatureExtractor(use_atom_features=use_atom_features)
-                chain_mapping = {}
-                if len(ab_chains_ids) >= 1:
-                    chain_mapping['heavy'] = ab_chains_ids[0]
-                if len(ab_chains_ids) >= 2:
-                    chain_mapping['light'] = ab_chains_ids[1]
-                if len(ag_chains_ids) >= 1:
-                    chain_mapping['antigen'] = ag_chains_ids[0]
+                chain_mapping = build_all_chain_mapping(
+                    ab_chains_ids,
+                    ag_chains_ids,
+                )
 
-                sf = extractor.extract_from_pdb(pdb_path, chain_mapping)
+                sf = cached_structure_extraction(pdb_path, chain_mapping, use_atom_features)
+                sf = ensure_structure_residue_ids(sf, pdb_path, chain_mapping)
                 if len(sf['coords']) > 0:
-                    sf = attach_mutation_masks(sf, mutation_sites)
+                    sf = attach_mutation_masks(
+                        sf,
+                        mutation_sites,
+                        mutation_types=mutation_types,
+                        # Persist mismatch counts so the full training audit can
+                        # report every affected site before blocking training.
+                        strict_wt_check=False,
+                    )
+                    sf, _ = attach_structure_chain_indices(sf)
                     sf['batch_ids'] = torch.zeros_like(sf['segment_ids'])
                     structure_data = sf
             except Exception as e:
@@ -209,6 +232,11 @@ def process_one_sample(args):
             "delta_g": torch.tensor(ddG, dtype=torch.float32),
             "structure_data": structure_data,
             "pdb_id": pdb_id,
+            "complex_id": str(row_dict["#Pdb"]),
+            "mutation_site_id": build_mutation_site_id(
+                str(row_dict["#Pdb"]),
+                str(row_dict["Mutation(s)_cleaned"]),
+            ),
             "foldx_version": getattr(config, "FOLDX_VERSION", "foldx"),
             "foldx_path": os.path.abspath(config.FOLDX_PATH),
         }
@@ -225,6 +253,36 @@ def process_one_sample(args):
         raise RuntimeError(f"Failed to precompute sample row {idx}") from e
 
 
+def exception_chain_text(exc):
+    messages = []
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip()
+        if text and text not in messages:
+            messages.append(text)
+        current = current.__cause__ or current.__context__
+    return "\nCaused by: ".join(messages)
+
+
+def is_filterable_structure_failure(error_text):
+    return any(
+        marker in error_text
+        for marker in FILTERABLE_STRUCTURE_ERROR_MARKERS
+    )
+
+
+def write_failure_report(rows, report_name):
+    if not rows:
+        return None
+    report_base = os.path.join(config.VARIANT_DIR, report_name)
+    with open(report_base + ".json", "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+    pd.DataFrame(rows).to_csv(report_base + ".csv", index=False)
+    return report_base
+
+
 def main():
     args = parse_args()
     os.makedirs(PRECOMPUTED_DIR, exist_ok=True)
@@ -236,8 +294,71 @@ def main():
 
     # Check which samples already exist
     todo = []
-    skipped_foldx_failed = 0
+    skipped_foldx_failed = []
+
+    def record_filtered_row(local_idx, original_row_idx, row, status, error, cache_path):
+        skipped_foldx_failed.append(
+            {
+                "local_idx": int(local_idx),
+                "original_row_idx": int(original_row_idx),
+                "pdb": row.get("#Pdb", ""),
+                "mutation": row.get("Mutation(s)_cleaned", ""),
+                "status": status,
+                "error": error,
+                "cache_path": cache_path,
+            }
+        )
+
     for i in range(len(df)):
+        row = df.iloc[i]
+        real_idx = int(row["original_row_idx"])
+        try:
+            mutation_cache, mutation_cache_path = read_mutation_foldx_cache(real_idx)
+        except FileNotFoundError as exc:
+            mutation_cache_path = os.path.join(
+                getattr(config, "MUTATION_FOLDX_CACHE_DIR", os.path.join(config.BASE_DIR, "foldx_mutation_cache")),
+                "sample_json",
+                f"{real_idx}.json",
+            )
+            out_path = os.path.join(PRECOMPUTED_DIR, f"{i}.pt")
+            if os.path.exists(out_path):
+                raise RuntimeError(
+                    f"Mutation FoldX cache for row {real_idx} is missing, but stale precomputed sample exists: "
+                    f"{out_path}. Remove this .pt or rebuild {PRECOMPUTED_DIR} before training."
+                ) from exc
+            if not getattr(config, "FILTER_FAILED_MUTATION_FOLDX", True):
+                raise
+            record_filtered_row(
+                i,
+                real_idx,
+                row,
+                "missing",
+                str(exc),
+                mutation_cache_path,
+            )
+            continue
+        if mutation_cache.get("status") != "ok":
+            out_path = os.path.join(PRECOMPUTED_DIR, f"{i}.pt")
+            if os.path.exists(out_path):
+                raise RuntimeError(
+                    f"FoldX-failed row {real_idx} is filtered, but stale precomputed sample exists: "
+                    f"{out_path}. Remove this .pt or rebuild {PRECOMPUTED_DIR} before training."
+                )
+            if not getattr(config, "FILTER_FAILED_MUTATION_FOLDX", True):
+                raise ValueError(
+                    f"Mutation FoldX cache for row {real_idx} is not ok: "
+                    f"status={mutation_cache.get('status')!r}, path={mutation_cache_path}"
+                )
+            record_filtered_row(
+                i,
+                real_idx,
+                row,
+                mutation_cache.get("status"),
+                mutation_cache.get("error", ""),
+                mutation_cache_path,
+            )
+            continue
+
         out_path = os.path.join(PRECOMPUTED_DIR, f"{i}.pt")
         needs_update = True
         if os.path.exists(out_path):
@@ -249,10 +370,43 @@ def main():
                     and "mutation_mask" in structure_data
                     and "mutation_ca_mask" in structure_data
                 )
+                has_residue_ids = structure_data is not None and "residue_ids" in structure_data
+                has_mutant_aa_types = (
+                    structure_data is not None
+                    and "wt_aa_types" in structure_data
+                    and "mutant_aa_types" in structure_data
+                    and "mutation_site_count" in structure_data
+                    and "matched_mutation_site_count" in structure_data
+                    and "mutation_wt_mismatch_count" in structure_data
+                    and structure_data.get("mutation_type_feature_version")
+                    == getattr(config, "MUTATION_TYPE_FEATURE_VERSION", 2)
+                )
+                has_all_chain_mapping = (
+                    structure_data is not None
+                    and isinstance(
+                        structure_data.get("chain_numeric_ids"),
+                        torch.Tensor,
+                    )
+                    and structure_data["chain_numeric_ids"].shape
+                    == structure_data["segment_ids"].shape
+                    and structure_data.get(
+                        "structure_chain_mapping_version"
+                    )
+                    == getattr(
+                        config,
+                        "STRUCTURE_CHAIN_MAPPING_VERSION",
+                        2,
+                    )
+                )
                 needs_update = (
                     sample.get("foldx_version") != getattr(config, "FOLDX_VERSION", "foldx")
                     or sample.get("foldx_path") != os.path.abspath(config.FOLDX_PATH)
                     or (config.USE_STRUCTURE_FEATURES and not has_mutation_masks)
+                    or (config.USE_STRUCTURE_FEATURES and not has_residue_ids)
+                    or (config.USE_STRUCTURE_FEATURES and not has_mutant_aa_types)
+                    or (config.USE_STRUCTURE_FEATURES and not has_all_chain_mapping)
+                    or not sample.get("complex_id")
+                    or not sample.get("mutation_site_id")
                     or sample.get("foldx_feature_mode") != getattr(config, "FOLDX_FEATURE_MODE", "wt_mut_delta")
                 )
                 if getattr(config, "USE_MUTATION_FOLDX_FEATURES", True):
@@ -271,33 +425,118 @@ def main():
             except Exception:
                 needs_update = True
         if needs_update:
-            row = df.iloc[i]
-            real_idx = int(row["original_row_idx"])
             out_path = os.path.join(PRECOMPUTED_DIR, f"{i}.pt")
             todo.append((real_idx, row.to_dict(), config.PDB_DIR, config.FOLDX_CACHE_DIR,
                           config.USE_STRUCTURE_FEATURES, config.USE_ATOM_FEATURES, out_path))
 
     print(f"Total samples: {len(df)}, to precompute: {len(todo)}")
     if skipped_foldx_failed:
-        print(f"Skipped known FoldX failures: {skipped_foldx_failed}")
+        report_base = os.path.join(config.VARIANT_DIR, "foldx_failed_filtered_rows")
+        with open(report_base + ".json", "w", encoding="utf-8") as f:
+            json.dump(skipped_foldx_failed, f, indent=2, ensure_ascii=False)
+        pd.DataFrame(skipped_foldx_failed).to_csv(report_base + ".csv", index=False)
+        print(
+            f"Explicitly filtered FoldX-missing/failed samples: {len(skipped_foldx_failed)} "
+            f"(reports: {report_base}.json and {report_base}.csv)"
+        )
     if not todo:
-        print("All samples already precomputed!")
+        existing_pt_count = len([name for name in os.listdir(PRECOMPUTED_DIR) if name.endswith(".pt")])
+        if existing_pt_count == 0:
+            raise RuntimeError(
+                "No valid precomputed samples were created. "
+                f"All {len(skipped_foldx_failed)} checked rows are missing or failed mutation FoldX JSON. "
+                "Run precompute_mutation_foldx.py first, or point MUTATION_FOLDX_CACHE_DIR to an existing cache."
+            )
+        print(f"All valid samples already precomputed! Existing .pt files: {existing_pt_count}")
         return
 
+    esm_ready_marker = os.path.join(
+        PRECOMPUTED_DIR,
+        ".esm_localtoken32_ready.json",
+    )
+    if os.path.exists(esm_ready_marker):
+        os.remove(esm_ready_marker)
+
     success = 0
+    filtered_structure_failures = []
+    unexpected_failures = []
 
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {executor.submit(process_one_sample, t): t[0] for t in todo}
+        futures = {
+            executor.submit(process_one_sample, task): task
+            for task in todo
+        }
         for future in tqdm(as_completed(futures), total=len(futures), desc="Precomputing"):
-            real_idx = futures[future]
-            idx, saved_path = future.result()
+            task = futures[future]
+            real_idx, row_dict, _, _, _, _, out_path = task
+            local_idx = int(
+                os.path.splitext(os.path.basename(out_path))[0]
+            )
+            try:
+                idx, saved_path = future.result()
+            except Exception as exc:
+                error_text = exception_chain_text(exc)
+                failure = {
+                    "local_idx": local_idx,
+                    "original_row_idx": int(real_idx),
+                    "pdb": row_dict.get("#Pdb", ""),
+                    "mutation": row_dict.get("Mutation(s)_cleaned", ""),
+                    "error": error_text,
+                    "output_path": out_path,
+                }
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+                if (
+                    getattr(
+                        config,
+                        "FILTER_STRUCTURE_ALIGNMENT_FAILURES",
+                        True,
+                    )
+                    and is_filterable_structure_failure(error_text)
+                ):
+                    filtered_structure_failures.append(failure)
+                else:
+                    unexpected_failures.append(failure)
+                continue
             if int(idx) != int(real_idx):
                 raise RuntimeError(f"Worker row mismatch: expected {real_idx}, got {idx}")
             if not os.path.exists(saved_path):
                 raise FileNotFoundError(f"Worker reported success but output is missing: {saved_path}")
             success += 1
 
-    print(f"Done. Success: {success}")
+    structure_report = write_failure_report(
+        filtered_structure_failures,
+        "structure_alignment_filtered_rows",
+    )
+    unexpected_report = write_failure_report(
+        unexpected_failures,
+        "precompute_unexpected_failed_rows",
+    )
+    if filtered_structure_failures:
+        print(
+            "Explicitly filtered structure-alignment failures: "
+            f"{len(filtered_structure_failures)} "
+            f"(reports: {structure_report}.json and {structure_report}.csv)"
+        )
+    if unexpected_failures:
+        raise RuntimeError(
+            f"{len(unexpected_failures)} unexpected sample-precompute "
+            "failures remain. They were not filtered. Reports: "
+            f"{unexpected_report}.json and {unexpected_report}.csv"
+        )
+
+    existing_pt_count = len(
+        [
+            name
+            for name in os.listdir(PRECOMPUTED_DIR)
+            if name.endswith(".pt")
+        ]
+    )
+    print(
+        f"Done. Newly written: {success}; "
+        f"structure-filtered: {len(filtered_structure_failures)}; "
+        f"total .pt files: {existing_pt_count}"
+    )
 
 
 if __name__ == "__main__":
